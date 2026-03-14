@@ -3,14 +3,18 @@
 
 import os
 
-from core.parser import LogFile, DebugLevel, time_args, time_diff_args, parse_time
+from core.parser import LogFile, DebugLevel, time_args
 
 
 _log_cache = {}
-_base_times = {}
 _search_cache = {}
 _search_cache_order = []
 _SEARCH_CACHE_MAX = 64
+
+# If total_matching > this, query_logs returns no rows — only total_matching, object_count, and message.
+MAX_MATCHING_TO_RETURN_ROWS = 100
+# If distinct object count > this, message tells agent to narrow by object.
+MAX_OBJECTS_SUGGEST_NARROW = 30
 
 
 def norm_path(raw_path, project_root, log_files_dir):
@@ -53,7 +57,7 @@ def load_log(path, project_root, log_files_dir):
             "time_span": {"first": time_args(t0), "last": time_args(t1)},
             "levels": log.level_names,
             "categories": log.category_names,
-            "objects": sorted(log.object_names),
+            "object_count": len(log.object_names),
         }
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -68,18 +72,21 @@ def _clear_search_cache_for_path(path):
             _search_cache_order.remove(k)
 
 
-def _parse_time_opt(s):
-    if not s or not str(s).strip():
+def _time_ms_to_ns(log, time_ms):
+    """Convert milliseconds from log start (integer only) to absolute ns."""
+    if time_ms is None:
         return None
     try:
-        return parse_time(str(s).strip())
-    except Exception:
+        ms = int(time_ms)
+    except (TypeError, ValueError):
         return None
+    return log.time_span[0] + ms * 1_000_000
 
 
 def _get_filtered_indices(path, log, level, category, thread, obj, function, filename, search, time_start=None, time_end=None):
-    time_min = _parse_time_opt(time_start)
-    time_max = _parse_time_opt(time_end)
+    # time_start/time_end: integer milliseconds from log start (no fractions)
+    time_min = _time_ms_to_ns(log, time_start)
+    time_max = _time_ms_to_ns(log, time_end)
     base = log.get_filtered_indices(
         level=level, category=category, thread=thread, object_name=obj, function=function, filename=filename,
         time_min=time_min, time_max=time_max,
@@ -108,10 +115,10 @@ def _get_filtered_indices(path, log, level, category, thread, obj, function, fil
     return _search_cache[key]
 
 
-def _row_to_dict(log, index, base_time=None):
+def _row_to_dict(log, index):
     line = log.get_line(index)
     ts = line[0]
-    time_str = time_diff_args(ts - base_time) if base_time else time_args(ts)[2:]
+    time_str = time_args(ts)[2:]  # absolute time MM:SS.ns
     level = line[3]
     level_name = level.name if isinstance(level, DebugLevel) else str(level)
     return {
@@ -135,27 +142,51 @@ def get_log(path, project_root, log_files_dir):
     return _log_cache.get(path)
 
 
+def _count_distinct_objects(log, indices):
+    seen = set()
+    for i in indices:
+        obj = log._object_names_list[log._object_ids[i]]
+        if obj:
+            seen.add(obj)
+    return len(seen)
+
+
 def get_lines(path, project_root, log_files_dir, limit=500,
               level=None, category=None, thread=None, object_name=None, function=None, filename=None, search=None,
-              time_start=None, time_end=None, base_time=None):
+              time_start=None, time_end=None):
     path = norm_path(path, project_root, log_files_dir) if path and not os.path.isabs(path) else path
     log = _log_cache.get(path)
     if not log:
         return {"ok": False, "error": "Log not loaded"}
-    if base_time is None:
-        base_time = _base_times.get(path)
     limit = max(1, min(2000, limit))
     filtered = _get_filtered_indices(path, log, level, category, thread, object_name, function, filename, search, time_start, time_end)
-    total_matching = len(filtered)
-    indices = filtered[:limit]
-    rows = [_row_to_dict(log, i, base_time) for i in indices]
+    filtered_list = list(filtered) if not isinstance(filtered, list) else filtered
+    total_matching = len(filtered_list)
+    if total_matching > MAX_MATCHING_TO_RETURN_ROWS:
+        object_count = _count_distinct_objects(log, filtered_list)
+        msg = (
+            f"total_matching ({total_matching}) exceeds maximum ({MAX_MATCHING_TO_RETURN_ROWS}). "
+            "Use log_summary with the same filters to see counts; narrow filters (time range, level, category, object_name, search) and try again."
+        )
+        if object_count > MAX_OBJECTS_SUGGEST_NARROW:
+            msg += f" There are {object_count} distinct objects in this range; narrow by object_name or search to reduce."
+        return {
+            "ok": True,
+            "total_matching": total_matching,
+            "object_count": object_count,
+            "returned": 0,
+            "rows": [],
+            "message": msg,
+        }
+    indices = filtered_list[:limit]
+    rows = [_row_to_dict(log, i) for i in indices]
     return {"ok": True, "rows": rows, "total_matching": total_matching, "returned": len(rows)}
 
 
 def get_summary(path, project_root, log_files_dir,
                 level=None, category=None, thread=None, object_name=None, function=None, filename=None, search=None,
                 time_start=None, time_end=None):
-    """Return counts only (no raw lines) for the filtered set."""
+    """Return counts only (no raw lines) for the filtered set. time_start/time_end: integer milliseconds from log start (no fractions)."""
     path = norm_path(path, project_root, log_files_dir) if path and not os.path.isabs(path) else path
     log = _log_cache.get(path)
     if not log:
@@ -183,11 +214,32 @@ def get_summary(path, project_root, log_files_dir,
     }
 
 
-def set_base_time(path, project_root, log_files_dir, line_index):
+def get_object_summary(path, project_root, log_files_dir, category, time_start, time_end):
+    """Per-level count of distinct objects and full object list in the given category and time range. category, time_start, time_end required. Time: integer milliseconds from log start (no fractions)."""
     path = norm_path(path, project_root, log_files_dir) if path and not os.path.isabs(path) else path
     log = _log_cache.get(path)
-    if not log or line_index is None or line_index < 0 or line_index >= len(log):
-        return {"ok": False}
-    line = log.get_line(line_index)
-    _base_times[path] = line[0]
-    return {"ok": True, "base_time": line[0]}
+    if not log:
+        return {"ok": False, "error": "Log not loaded"}
+    filtered = _get_filtered_indices(path, log, level=None, category=category, thread=None, obj=None, function=None, filename=None, search=None, time_start=time_start, time_end=time_end)
+    indices = list(filtered) if not isinstance(filtered, list) else filtered
+    # Per level: set of distinct object names
+    objects_by_level = {}
+    all_objects = set()
+    for i in indices:
+        lv = log.levels[i]
+        lv_name = lv.name if hasattr(lv, "name") else str(lv)
+        obj = log._object_names_list[log._object_ids[i]]
+        if obj:
+            all_objects.add(obj)
+            if lv_name not in objects_by_level:
+                objects_by_level[lv_name] = set()
+            objects_by_level[lv_name].add(obj)
+    count_by_level = {k: len(v) for k, v in objects_by_level.items()}
+    return {
+        "ok": True,
+        "total_matching": len(indices),
+        "count_by_level": count_by_level,
+        "object_names": sorted(all_objects),
+    }
+
+

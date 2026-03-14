@@ -22,9 +22,17 @@ def time_diff_args(time_diff):
 
 
 def parse_time(st):
+    """Parse time string to nanoseconds. Accepts H:MM:SS or H:MM:SS.frac (e.g. 0:00:10 or 0:00:10.123456789)."""
+    st = str(st).strip()
     h, m, s = st.split(":")
-    secs, subsecs = s.split(".")
-    return int((int(h) * 60 ** 2 + int(m) * 60) * SECOND) + int(secs) * SECOND + int(subsecs)
+    if "." in s:
+        secs, subsecs = s.split(".", 1)
+        subsecs = (subsecs + "000000000")[:9]  # pad to nanosec
+        subsec_ns = int(subsecs)
+    else:
+        secs = s
+        subsec_ns = 0
+    return int((int(h) * 60 ** 2 + int(m) * 60) * SECOND) + int(secs) * SECOND + subsec_ns
 
 
 _TIME_RE = re.compile(r"^(\d+:\d\d:\d\d\.\d+)")

@@ -2,30 +2,26 @@
 # -*- coding: utf-8 -*-
 """
 Test script for the GStreamer Logs MCP tools logic.
-Runs against the core service (no MCP transport). Use from project root:
+Prints SENT / GOT for each call. Run from project root:
 
   python scripts/test_mcp_tools.py
-
-Or with a specific log dir:
-
-  GST_LOGS_MCP_LOG_DIR=/path/to/logs python scripts/test_mcp_tools.py
 """
 import os
 import sys
+import json
 
-# Project root = parent of scripts/
 _scripts_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_scripts_dir)
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from core.service import (
-    norm_path,
     list_log_files,
     load_log,
     get_log,
     get_lines,
     get_summary,
+    get_object_summary,
 )
 
 LOG_FILES_DIR = os.path.normpath(os.path.abspath(
@@ -33,64 +29,98 @@ LOG_FILES_DIR = os.path.normpath(os.path.abspath(
 ))
 
 
+def show(name, sent, got):
+    print("=" * 60)
+    print(" ", name)
+    print("-" * 60)
+    print("SENT:", json.dumps(sent, ensure_ascii=False, default=str))
+    print("-" * 60)
+    if isinstance(got, dict):
+        if got.get("rows") and len(got["rows"]) > 5:
+            truncated = got.copy()
+            truncated["rows"] = got["rows"][:5]
+            truncated["_rows_truncated"] = len(got["rows"]) - 5
+            print("GOT:", json.dumps(truncated, ensure_ascii=False, default=str, indent=2))
+        else:
+            print("GOT:", json.dumps(got, ensure_ascii=False, default=str, indent=2))
+    else:
+        print("GOT:", got)
+    print()
+
+
 def main():
-    print("GStreamer Logs MCP – tool test")
+    print("GStreamer Logs MCP – tool test (SENT / GOT)")
     print("Log dir:", LOG_FILES_DIR)
     print()
 
     # 1) list_log_files
+    sent = {"log_dir": LOG_FILES_DIR}
     files = list_log_files(LOG_FILES_DIR)
     if not files:
-        print("No log files in", LOG_FILES_DIR)
+        show("list_log_files", sent, {"error": "No files", "files": []})
         return 1
-    print("list_log_files:", len(files), "file(s)", [f["name"] for f in files[:5]])
+    got = {"ok": True, "files": [f["name"] for f in files], "count": len(files)}
+    show("list_log_files", sent, got)
     path = files[0]["path"]
-    print("Using file:", path)
-    print()
 
     # 2) load_log
+    sent = {"path": path}
     result = load_log(path, _project_root, LOG_FILES_DIR)
     if not result.get("ok"):
-        print("load_log failed:", result.get("error"))
+        show("load_log", sent, result)
         return 1
-    print("load_log: ok, total =", result["total"], ", time_span =", result.get("time_span"))
-    print("  levels (sample):", result["levels"][:5] if len(result["levels"]) > 5 else result["levels"])
-    print("  objects (sample):", result["objects"][:8] if len(result["objects"]) > 8 else result["objects"])
-    print()
+    show("load_log", sent, result)
 
     # 3) log_summary (no filters)
+    sent = {"path": path}
     summary = get_summary(path, _project_root, LOG_FILES_DIR)
+    show("log_summary (no filters)", sent, summary)
     if not summary.get("ok"):
-        print("get_summary failed:", summary.get("error"))
         return 1
-    print("log_summary (no filters): total_matching =", summary["total_matching"])
-    print("  count_by_level:", summary["count_by_level"])
-    print()
 
-    # 4) log_summary with level=ERROR (if any)
-    summary_err = get_summary(path, _project_root, LOG_FILES_DIR, level="ERROR")
-    if summary_err.get("ok"):
-        print("log_summary(level=ERROR): total_matching =", summary_err["total_matching"])
-    print()
+    # 4) log_summary with time in milliseconds (0 ms to 10500 ms = 10.5s)
+    sent = {"path": path, "time_start": 0, "time_end": 10500}
+    summary_t = get_summary(path, _project_root, LOG_FILES_DIR, time_start=0, time_end=10500)
+    show("log_summary (time_start=0, time_end=10500 ms)", sent, summary_t)
 
-    # 5) query_logs with limit
-    lines_result = get_lines(path, _project_root, LOG_FILES_DIR, limit=3)
-    if not lines_result.get("ok"):
-        print("get_lines failed:", lines_result.get("error"))
-        return 1
-    print("query_logs(limit=3): total_matching =", lines_result["total_matching"], ", returned =", lines_result["returned"])
-    for i, row in enumerate(lines_result["rows"]):
-        print("  ", i + 1, row.get("time"), row.get("level"), row.get("object") or "", (row.get("message") or "")[:60])
-    print()
+    # 5) log_summary with category + time (ms)
+    categories = result.get("categories") or []
+    cat = categories[0] if categories else None
+    sent = {"path": path, "category": cat, "time_start": 0, "time_end": 5000}
+    summary_c = get_summary(path, _project_root, LOG_FILES_DIR, category=cat, time_start=0, time_end=5000) if cat else {"ok": False, "error": "no category"}
+    show("log_summary (category + time)", sent, summary_c)
 
-    # 6) query_logs with time range (first few seconds) if we have time_span
-    t0 = result.get("time_span", {}).get("first", "")
-    if t0:
-        # ask for first 1 second: 0:00:00.0 to 0:00:01.0
-        lines_win = get_lines(path, _project_root, LOG_FILES_DIR, time_start="0:00:00.000000000", time_end="0:00:01.000000000", limit=5)
-        if lines_win.get("ok"):
-            print("query_logs(time 0..1s, limit=5): total_matching =", lines_win["total_matching"], ", returned =", lines_win["returned"])
-    print()
+    # 6) object_summary: required category + time (ms)
+    if cat:
+        sent = {"path": path, "category": cat, "time_start": 0, "time_end": 5000}
+        obj_sum = get_object_summary(path, _project_root, LOG_FILES_DIR, category=cat, time_start=0, time_end=5000)
+        show("object_summary (category + time)", sent, obj_sum)
+    else:
+        print("=" * 60)
+        print(" object_summary – skipped (no category)")
+        print()
+
+    # 7) query_logs with category + time (ms) and limit
+    sent = {"path": path, "category": cat, "time_start": 0, "time_end": 2000, "limit": 5}
+    lines_result = (
+        get_lines(path, _project_root, LOG_FILES_DIR, category=cat, time_start=0, time_end=2000, limit=5)
+        if cat else {"ok": False, "error": "category required"}
+    )
+    show("query_logs (category + time + limit)", sent, lines_result)
+
+    # 8) query_logs without category (service allows it; server would reject)
+    sent = {"path": path, "time_start": 0, "time_end": 1000, "limit": 3}
+    lines_no_cat = get_lines(path, _project_root, LOG_FILES_DIR, time_start=0, time_end=1000, limit=3)
+    show("query_logs (no category)", sent, lines_no_cat)
+
+    # 9) query_logs with optional object_name (time in ms)
+    if summary_c.get("ok") and summary_c.get("count_by_object"):
+        first_obj = next(iter(summary_c["count_by_object"].keys()), None)
+        if first_obj and cat:
+            sent = {"path": path, "category": cat, "time_start": 0, "time_end": 5000, "object_name": first_obj, "limit": 3}
+            lines_obj = get_lines(path, _project_root, LOG_FILES_DIR, category=cat, time_start=0, time_end=5000, object_name=first_obj, limit=3)
+            show("query_logs (category + time + object_name)", sent, lines_obj)
+
     print("Done.")
     return 0
 
